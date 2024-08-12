@@ -141,6 +141,11 @@ func (c *criService) getContainerRootDir(id string) string {
 	return filepath.Join(c.config.RootDir, containersDir, id)
 }
 
+// getImageVolumeDir returns the image volume directory for share.
+func (c *criService) getImageVolumeDir(id string) string {
+	return filepath.Join(c.config.RootDir, "image-volume", id)
+}
+
 // getVolatileContainerRootDir returns the root directory for managing volatile container files,
 // e.g. named pipes.
 func (c *criService) getVolatileContainerRootDir(id string) string {

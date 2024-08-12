@@ -325,6 +325,25 @@ func WithIDMapVolumeMount(hostPath, containerPath string, uidMaps, gidMaps []*ru
 	}
 }
 
+func WithImageVolumeMount(image, containerPath string) ContainerOpts {
+	return WithIDMapImageVolumeMount(image, containerPath, nil, nil)
+}
+
+func WithIDMapImageVolumeMount(image string, containerPath string, uidMaps, gidMaps []*runtime.IDMapping) ContainerOpts {
+	return func(c *runtime.ContainerConfig) {
+		containerPath, _ = filepath.Abs(containerPath)
+		mount := &runtime.Mount{
+			ContainerPath: containerPath,
+			UidMappings:   uidMaps,
+			GidMappings:   gidMaps,
+			Image: &runtime.ImageSpec{
+				Image: image,
+			},
+		}
+		c.Mounts = append(c.Mounts, mount)
+	}
+}
+
 func WithWindowsUsername(username string) ContainerOpts {
 	return func(c *runtime.ContainerConfig) {
 		if c.Windows == nil {

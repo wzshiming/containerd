@@ -20,14 +20,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
 	"github.com/containerd/typeurl/v2"
 	"github.com/davecgh/go-spew/spew"
+	"github.com/opencontainers/image-spec/identity"
 	imagespec "github.com/opencontainers/image-spec/specs-go/v1"
 	runtimespec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/selinux/go-selinux"
@@ -36,6 +39,9 @@ import (
 
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/containers"
+	"github.com/containerd/containerd/v2/core/leases"
+	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/defaults"
 	"github.com/containerd/containerd/v2/internal/cri/annotations"
 	criconfig "github.com/containerd/containerd/v2/internal/cri/config"
 	cio "github.com/containerd/containerd/v2/internal/cri/io"
@@ -163,6 +169,11 @@ func (c *criService) CreateContainer(ctx context.Context, r *runtime.CreateConta
 
 	var volumeMounts []*runtime.Mount
 	if !c.config.IgnoreImageDefinedVolumes {
+		err = c.mutateMounts(ctx, platform, config.GetMounts())
+		if err != nil {
+			return nil, fmt.Errorf("failed to mutate mount config: %w", err)
+		}
+
 		// Create container image volumes mounts.
 		volumeMounts = c.volumeMounts(platform, containerRootDir, config, &image.ImageSpec.Config)
 	} else if len(image.ImageSpec.Config.Volumes) != 0 {
@@ -360,6 +371,106 @@ func (c *criService) CreateContainer(ctx context.Context, r *runtime.CreateConta
 		tracing.Attribute("container.create.duration", time.Since(start).String()),
 	)
 	return &runtime.CreateContainerResponse{ContainerId: id}, nil
+}
+
+func (c *criService) mutateMounts(
+	ctx context.Context,
+	platform imagespec.Platform,
+	extraMounts []*runtime.Mount,
+) error {
+	for _, m := range extraMounts {
+		err := c.mutateOCIBindMount(ctx, platform, m)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *criService) mutateOCIBindMount(
+	ctx context.Context,
+	platform imagespec.Platform,
+	extraMount *runtime.Mount,
+) (retErr error) {
+	imageSpec := extraMount.GetImage()
+	if imageSpec == nil {
+		return nil
+	}
+
+	ref := imageSpec.GetImage()
+	if ref == "" {
+		return fmt.Errorf("image not specified")
+	}
+
+	image, err := c.LocalResolve(ref)
+	if err != nil {
+		return fmt.Errorf("failed to resolve image %q: %w", ref, err)
+	}
+	target := c.getImageVolumeDir(strings.TrimPrefix(image.ID, "sha256:"))
+
+	snapshotter := defaults.DefaultSnapshotter
+
+	ctx, done, err := c.client.WithLease(ctx,
+		leases.WithID(target),
+		leases.WithExpiration(24*time.Hour),
+		leases.WithLabel("containerd.io/gc.ref.snapshot."+snapshotter, target),
+	)
+	if err != nil && !errdefs.IsAlreadyExists(err) {
+		return fmt.Errorf("failed to create lease %q: %w", target, err)
+	}
+	if done != nil {
+		defer func() {
+			if retErr != nil {
+				_ = done(ctx)
+			}
+		}()
+	}
+
+	img, err := c.client.ImageService().Get(ctx, ref)
+	if err != nil {
+		return fmt.Errorf("failed to get image %q: %w", ref, err)
+	}
+
+	i := containerd.NewImageWithPlatform(c.client, img, platforms.Only(platform))
+	if err := i.Unpack(ctx, snapshotter); err != nil {
+		return fmt.Errorf("failed to unpacking image: %w", err)
+	}
+
+	diffIDs, err := i.RootFS(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to getting diff IDs for image %q: %w", ref, err)
+	}
+	chainID := identity.ChainID(diffIDs).String()
+
+	s := c.client.SnapshotService(snapshotter)
+	mounts, err := s.View(ctx, target, chainID)
+	if err != nil {
+		if !errdefs.IsAlreadyExists(err) {
+			return fmt.Errorf("failed to get view for image %q: %w", ref, err)
+		}
+		mounts, err = s.Mounts(ctx, target)
+		if err != nil {
+			return fmt.Errorf("failed to get mounts for image %q: %w", ref, err)
+		}
+	}
+	defer func() {
+		if retErr != nil {
+			_ = s.Remove(ctx, target)
+		}
+	}()
+
+	err = os.MkdirAll(target, 0755)
+	if err != nil {
+		return fmt.Errorf("failed to creating directory %q: %w", target, err)
+	}
+
+	if err := mount.All(mounts, target); err != nil {
+		return fmt.Errorf("failed to mounting %q: %w", target, err)
+	}
+
+	extraMount.HostPath = target
+	extraMount.Readonly = true
+	return nil
 }
 
 // volumeMounts sets up image volumes for container. Rely on the removal of container
