@@ -100,6 +100,9 @@ func WithMounts(osi osinterface.OS, config *runtime.ContainerConfig, extra []*ru
 		}
 
 		for _, mount := range mounts {
+			if mount.GetImage() != nil {
+				continue
+			}
 			var (
 				dst = mount.GetContainerPath()
 				src = mount.GetHostPath()

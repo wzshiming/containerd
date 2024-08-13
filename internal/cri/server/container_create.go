@@ -169,11 +169,6 @@ func (c *criService) CreateContainer(ctx context.Context, r *runtime.CreateConta
 
 	var volumeMounts []*runtime.Mount
 	if !c.config.IgnoreImageDefinedVolumes {
-		err = c.mutateMounts(ctx, platform, config.GetMounts())
-		if err != nil {
-			return nil, fmt.Errorf("failed to mutate mount config: %w", err)
-		}
-
 		// Create container image volumes mounts.
 		volumeMounts = c.volumeMounts(platform, containerRootDir, config, &image.ImageSpec.Config)
 	} else if len(image.ImageSpec.Config.Volumes) != 0 {
@@ -252,9 +247,14 @@ func (c *criService) CreateContainer(ctx context.Context, r *runtime.CreateConta
 	if len(volumeMounts) > 0 {
 		mountMap := make(map[string]string)
 		for _, v := range volumeMounts {
+			if v.Image != nil {
+				continue
+			}
 			mountMap[filepath.Clean(v.HostPath)] = v.ContainerPath
 		}
-		opts = append(opts, customopts.WithVolumes(mountMap, platform))
+		if len(mountMap) > 0 {
+			opts = append(opts, customopts.WithVolumes(mountMap, platform))
+		}
 	}
 	meta.ImageRef = image.ID
 	meta.StopSignal = image.ImageSpec.Config.StopSignal
@@ -334,6 +334,17 @@ func (c *criService) CreateContainer(ctx context.Context, r *runtime.CreateConta
 		}
 	}()
 
+	ociSpec, err := cntr.Spec(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get container spec: %w", err)
+	}
+
+	// Image volume mount
+	err = c.imageMounts(ctx, platform, ociSpec.Root.Path, config.GetMounts())
+	if err != nil {
+		return nil, fmt.Errorf("failed to mutate mount config: %w", err)
+	}
+
 	status := containerstore.Status{CreatedAt: time.Now().UnixNano()}
 	status = copyResourcesToStatus(spec, status)
 	container, err := containerstore.NewContainer(meta,
@@ -373,13 +384,14 @@ func (c *criService) CreateContainer(ctx context.Context, r *runtime.CreateConta
 	return &runtime.CreateContainerResponse{ContainerId: id}, nil
 }
 
-func (c *criService) mutateMounts(
+func (c *criService) imageMounts(
 	ctx context.Context,
 	platform imagespec.Platform,
+	containerRootDir string,
 	extraMounts []*runtime.Mount,
 ) error {
 	for _, m := range extraMounts {
-		err := c.mutateOCIBindMount(ctx, platform, m)
+		err := c.imagesMounts(ctx, platform, containerRootDir, m)
 		if err != nil {
 			return err
 		}
@@ -387,9 +399,10 @@ func (c *criService) mutateMounts(
 	return nil
 }
 
-func (c *criService) mutateOCIBindMount(
+func (c *criService) imagesMounts(
 	ctx context.Context,
 	platform imagespec.Platform,
+	containerRootDir string,
 	extraMount *runtime.Mount,
 ) (retErr error) {
 	imageSpec := extraMount.GetImage()
@@ -402,11 +415,7 @@ func (c *criService) mutateOCIBindMount(
 		return fmt.Errorf("image not specified")
 	}
 
-	image, err := c.LocalResolve(ref)
-	if err != nil {
-		return fmt.Errorf("failed to resolve image %q: %w", ref, err)
-	}
-	target := c.getImageVolumeDir(strings.TrimPrefix(image.ID, "sha256:"))
+	target := filepath.Join(containerRootDir, extraMount.ContainerPath)
 
 	snapshotter := defaults.DefaultSnapshotter
 
@@ -445,13 +454,7 @@ func (c *criService) mutateOCIBindMount(
 	s := c.client.SnapshotService(snapshotter)
 	mounts, err := s.View(ctx, target, chainID)
 	if err != nil {
-		if !errdefs.IsAlreadyExists(err) {
-			return fmt.Errorf("failed to get view for image %q: %w", ref, err)
-		}
-		mounts, err = s.Mounts(ctx, target)
-		if err != nil {
-			return fmt.Errorf("failed to get mounts for image %q: %w", ref, err)
-		}
+		return fmt.Errorf("failed to get view for image %q: %w", ref, err)
 	}
 	defer func() {
 		if retErr != nil {
@@ -468,8 +471,6 @@ func (c *criService) mutateOCIBindMount(
 		return fmt.Errorf("failed to mounting %q: %w", target, err)
 	}
 
-	extraMount.HostPath = target
-	extraMount.Readonly = true
 	return nil
 }
 

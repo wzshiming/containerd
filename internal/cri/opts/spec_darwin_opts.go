@@ -80,6 +80,9 @@ func WithDarwinMounts(osi osinterface.OS, config *runtime.ContainerConfig, extra
 		}
 
 		for _, mount := range mounts {
+			if mount.GetImage() != nil {
+				continue
+			}
 			var (
 				dst = mount.GetContainerPath()
 				src = mount.GetHostPath()

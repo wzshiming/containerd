@@ -150,6 +150,9 @@ func WithWindowsMounts(osi osinterface.OS, config *runtime.ContainerConfig, extr
 		}
 
 		for _, mount := range mounts {
+			if mount.GetImage() != nil {
+				continue
+			}
 			parsedMount, err := parseMount(osi, mount)
 			if err != nil {
 				return err
